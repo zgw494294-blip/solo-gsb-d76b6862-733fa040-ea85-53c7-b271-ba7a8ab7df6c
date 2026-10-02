@@ -493,14 +493,23 @@ class TracePackingEvent(_TraceEventBase):
     child_scan: str
 
 
+class TraceSealEvent(_TraceEventBase):
+    """封签 / 拆签事件:对一件含 AI 21 的库存实物加封或摘除封签。"""
+
+    action: Literal["seal", "unseal"]
+    scan: str
+    seal_id: str = Field(min_length=1)  # 非空封签编号;拆签须与当前封签一致
+
+
 # 以 action 为判别字段的联合;非法 action / 字段缺失或多余均由 pydantic 返回 422
 TraceEvent = Annotated[
-    TraceTransferEvent | TracePackingEvent, Field(discriminator="action")
+    TraceTransferEvent | TracePackingEvent | TraceSealEvent,
+    Field(discriminator="action"),
 ]
 
 
 class LocationTraceRequest(BaseModel):
-    """地点追溯请求:1~100 条库存扫描 + 1~100 条召回规则 + 1~200 条交接 / 装拆事件。
+    """地点追溯请求:1~100 条库存扫描 + 1~100 条召回规则 + 1~200 条交接 / 装拆 / 封签事件。
 
     库存扫描须全部合法、含 AI 21 且 GTIN+序列号唯一,否则整个请求返回 422;
     事件扫描的合法性、库存引用与批号 / 有效期一致性按事件原下标报错,不生效。
@@ -510,7 +519,7 @@ class LocationTraceRequest(BaseModel):
 
     scans: list[str] = Field(min_length=1, max_length=100)  # 库存扫描,须含 AI 21
     rules: list[Rule] = Field(min_length=1, max_length=100)  # 召回规则,同召回核验
-    events: list[TraceEvent] = Field(min_length=1, max_length=200)  # 交接 / 装拆事件
+    events: list[TraceEvent] = Field(min_length=1, max_length=200)  # 交接 / 装拆 / 封签事件
     # 可选:同地共处统计截止时间(带时区);省略时仅返回原追溯结果
     contact_until: datetime | None = None
 
@@ -558,8 +567,18 @@ class LocationTraceContact(BaseModel):
     end_time: datetime  # UTC 止(不含)
 
 
+class SealedItem(BaseModel):
+    """重放结束时仍处于封签状态的一件库存实物及其封签编号。"""
+
+    gtin: str
+    serial: str
+    seal_id: str
+
+
 class LocationTraceResponse(BaseModel):
     items: list[LocationTraceItem]  # 仅含命中召回的库存实物,按 GTIN、序列号排序
     errors: list[LocationTraceEventError]  # 事件错误,按原始下标排序
     # 仅当请求提供 contact_until 时出现:未命中实物与命中实物的同地共处时段
     contacts: list[LocationTraceContact] | None = None
+    # 仅当事件含 seal / unseal 时出现:最终仍封签的全部库存实物(按 GTIN、序列号排序)
+    sealed_items: list[SealedItem] | None = None

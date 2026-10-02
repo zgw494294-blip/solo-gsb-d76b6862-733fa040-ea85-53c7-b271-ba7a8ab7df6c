@@ -11,7 +11,11 @@
 - 交接(transfer)仅作用于无父件实物;首次成功交接 from_location 须为 null,
   此后须等于当前持有人。根件交接时其全部后代随之换持有人并记录地点;
 - 装入(pack)要求双方已有**相同**持有人,且不能自装 / 成环,装入不改持有人;
-- 取出(unpack)须为当前直接父子关系,取出后子件保留当时持有人(不重复记地点)。
+- 取出(unpack)须为当前直接父子关系,取出后子件保留当时持有人(不重复记地点);
+- 封签(seal)要求持有人已知、自身未封签且无封签祖先;拆签(unseal)须匹配自身
+  当前封签且无封签祖先(由外向内逐层拆)。封签 / 拆签只改封签状态,不动持有人、
+  包装关系或地点。父件自身或祖先已封签时,装入 / 取出均失败;封签子件仍可随外层
+  整体装入、取出,根件交接仍带动后代。
 
 失败事件由内核保证不留下任何半次更新,后续事件继续从失败前状态处理。
 """
@@ -30,11 +34,14 @@ from .models import (
     LocationTraceItem,
     LocationTraceRequest,
     LocationTraceResponse,
+    SealedItem,
     TraceContactItem,
     TracePackingEvent,
+    TraceSealEvent,
     TraceTransferEvent,
 )
 from .replay import (
+    ALREADY_SEALED,
     CHILD_HAS_PARENT,
     FIRST_TRANSFER_FROM_NOT_NULL,
     HAS_PARENT_TRANSFER,
@@ -42,7 +49,11 @@ from .replay import (
     HOLDER_MISMATCH,
     HOLDER_MISSING,
     NOT_DIRECT_PARENT,
+    NOT_SEALED,
     PACK_CYCLE,
+    SEAL_HOLDER_MISSING,
+    SEAL_ID_MISMATCH,
+    SEALED_ANCESTOR,
     ReplayConfig,
     ReplayFailure,
     ReplayKernel,
@@ -122,6 +133,45 @@ def _failure_reason(failure: ReplayFailure) -> str:
         else:
             actual = f"子件的当前直接父件为{item_label(current)}"
         return f"取出失败:{actual},并非指定的父件{item_label(failure.parent)}"
+    if code == SEAL_HOLDER_MISSING:
+        assert failure.item is not None
+        return f"封签失败:{item_label(failure.item)}尚无成功交接,当前持有人未知,不能封签"
+    if code == ALREADY_SEALED:
+        assert failure.item is not None
+        return (
+            f"封签失败:{item_label(failure.item)}已处于封签状态"
+            f"(封签编号 {fmt_value(failure.expected)}),不能重复封签"
+        )
+    if code == NOT_SEALED:
+        assert failure.item is not None
+        return f"拆签失败:{item_label(failure.item)}当前未封签,不能拆签"
+    if code == SEAL_ID_MISMATCH:
+        assert failure.item is not None
+        return (
+            f"拆签失败:{item_label(failure.item)}当前封签编号为"
+            f"{fmt_value(failure.expected)},与拆签编号 {fmt_value(failure.actual)} 不一致"
+        )
+    if code == SEALED_ANCESTOR:
+        if failure.child is not None:
+            # 装入 / 取出被封签父件(或其封签祖先)阻断
+            verb = failure.detail or "装入"
+            assert failure.item is not None
+            if failure.item == failure.parent:
+                return (
+                    f"{verb}失败:父件{item_label(failure.parent)}自身已封签,"
+                    f"封签容器内不能{verb}"
+                )
+            return (
+                f"{verb}失败:父件{item_label(failure.parent)}的包装祖先"
+                f"{item_label(failure.item)}已封签,封签容器内不能{verb}"
+            )
+        # seal / unseal:存在更近的(已封签的)外层封签,须由外向内逐层处理
+        assert failure.item is not None and failure.parent is not None
+        verb = "拆签" if failure.detail == "unseal" else "封签"
+        return (
+            f"{verb}失败:{item_label(failure.item)}的包装祖先"
+            f"{item_label(failure.parent)}仍处于封签状态,须由外向内逐层处理"
+        )
     return failure.detail or "事件失败"
 
 
@@ -162,6 +212,9 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
         kernel.register(key, batch=parsed.batch, expiry=parsed.expiry)
         nodes_meta[key] = parsed
     errors: list[LocationTraceEventError] = []
+
+    # 请求中是否出现封签 / 拆签事件(即使全部失败):出现才在响应附 sealed_items
+    has_seal_events = any(isinstance(event, TraceSealEvent) for event in request.events)
 
     order = sorted(
         range(len(request.events)),
@@ -263,6 +316,16 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
                 failure = kernel.transfer(
                     index, key, event.from_location, event.to_location
                 )
+            elif isinstance(event, TraceSealEvent):
+                key, err = parse_party(event.scan, "扫描", index)
+                if err is not None:
+                    errors.append(LocationTraceEventError(index=index, reason=err))
+                    continue
+                assert key is not None
+                if event.action == "seal":
+                    failure = kernel.seal(index, key, event.seal_id)
+                else:
+                    failure = kernel.unseal(index, key, event.seal_id)
             else:
                 assert isinstance(event, TracePackingEvent)
                 parent_key, err = parse_party(event.parent_scan, "父件", index)
@@ -309,7 +372,19 @@ def trace_locations(request: LocationTraceRequest) -> LocationTraceResponse:
     contacts: list[LocationTraceContact] | None = None
     if contact_until is not None:
         contacts = _merge_and_order_contacts(closed_contacts)
-    return LocationTraceResponse(items=items, errors=errors, contacts=contacts)
+
+    sealed_items: list[SealedItem] | None = None
+    if has_seal_events:
+        # 最终仍封签的全部库存实物(含未命中召回者),按 GTIN、序列号排序
+        sealed_items = [
+            SealedItem(gtin=key[0], serial=key[1], seal_id=node.seal_id)
+            for key, node in sorted(kernel.nodes.items())
+            if node.seal_id is not None
+        ]
+
+    return LocationTraceResponse(
+        items=items, errors=errors, contacts=contacts, sealed_items=sealed_items
+    )
 
 
 def _merge_and_order_contacts(

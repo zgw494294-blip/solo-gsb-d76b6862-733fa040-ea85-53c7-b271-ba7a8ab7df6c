@@ -17,7 +17,8 @@
 - 独立交接(`custody`):无包装树,批号 / 有效期基准取**首次成功事件**
   (经提交前回调校验,失败不产生任何半次更新)。
 - 地点追溯(`trace`):以库存为基准(节点全部预先注册);装入双方须已有**相同
-  持有人**;交接只作用于根件并带动全部后代;取出保留当时持有人。
+  持有人**;交接只作用于根件并带动全部后代;取出保留当时持有人;封签 / 拆签
+  (`seal` / `unseal`)随事件审计,已封签(含封签祖先)的容器禁止再装入 / 取出。
 
 每个命令先完成全部校验,再一次性提交:失败命令不会留下父子边、持有人、成功
 下标或地点历史的半次更新,后续命令继续从失败前状态处理。
@@ -59,6 +60,7 @@ class ReplayConfig:
     propagate_transfer: bool = False  # 根件交接是否带动全部后代
     register_on_pack: bool = True  # 装入时是否允许注册此前未见过的实物
     unknown_on_unpack_fails: bool = True  # 取出时未在成功涉及集合中的实物是否报错
+    seal_aware: bool = False  # 是否维护封签(seal / unseal,并在装拆时校验封签)
 
     @classmethod
     def packing(cls) -> "ReplayConfig":
@@ -72,7 +74,7 @@ class ReplayConfig:
 
     @classmethod
     def trace(cls) -> "ReplayConfig":
-        """地点追溯:库存基准、同持有人才可装入、根件交接带动后代。"""
+        """地点追溯:库存基准、同持有人才可装入、根件交接带动后代、封签随事件审计。"""
         return cls(
             mode="trace",
             require_holders_for_pack=True,
@@ -80,6 +82,7 @@ class ReplayConfig:
             propagate_transfer=True,
             register_on_pack=False,
             unknown_on_unpack_fails=False,
+            seal_aware=True,
         )
 
 
@@ -94,6 +97,7 @@ class KernelNode:
     holder: str | None = None  # 当前持有人;尚未成功交接时为 None
     locations: list[str] = field(default_factory=list)  # 按首次到达顺序去重的地点历史
     success_indices: list[int] = field(default_factory=list)  # 成功命令的原下标
+    seal_id: str | None = None  # 当前封签 ID;未封签为 None
     meta: dict[str, object] = field(default_factory=dict)
 
     def arrive(self, location: str) -> None:
@@ -116,6 +120,11 @@ UNKNOWN_CHILD = "unknown_child"
 NOT_DIRECT_PARENT = "not_direct_parent"
 UNKNOWN_ITEM = "unknown_item"
 PRECHECK_REJECTED = "precheck_rejected"
+SEAL_HOLDER_MISSING = "seal_holder_missing"
+ALREADY_SEALED = "already_sealed"
+SEALED_ANCESTOR = "sealed_ancestor"
+NOT_SEALED = "not_sealed"
+SEAL_ID_MISMATCH = "seal_id_mismatch"
 
 
 @dataclass
@@ -199,6 +208,25 @@ class ReplayKernel:
             guard.add(node)
             node = self.parent_of[node]
         return node
+
+    def sealed_ancestor(self, key: ItemKey) -> ItemKey | None:
+        """沿父链(不含自身)向上找到的最近封签实物;没有时返回 None。"""
+        node = self.parent_of.get(key)
+        guard: set[ItemKey] = set()
+        while node is not None and node not in guard:
+            ancestor_node = self.nodes.get(node)
+            if ancestor_node is not None and ancestor_node.seal_id is not None:
+                return node
+            guard.add(node)
+            node = self.parent_of.get(node)
+        return None
+
+    def sealed_self_or_ancestor(self, key: ItemKey) -> ItemKey | None:
+        """key 自身或其沿父链向上的最近封签实物;都没有封签时返回 None。"""
+        node = self.nodes.get(key)
+        if node is not None and node.seal_id is not None:
+            return key
+        return self.sealed_ancestor(key)
 
     # ----- 交接 -----
 
@@ -308,6 +336,19 @@ class ReplayKernel:
                     actual=child_holder,
                 )
 
+        if self.config.seal_aware:
+            # 父件自身或其任一祖先已封签时,不能再装入;封签子件仍可整体装入
+            sealed = self.sealed_self_or_ancestor(parent_key)
+            if sealed is not None:
+                return ReplayFailure(
+                    code=SEALED_ANCESTOR,
+                    index=index,
+                    parent=parent_key,
+                    child=child_key,
+                    item=sealed,
+                    detail="装入",
+                )
+
         # 沿父链向上检查 child 是否为 parent 的祖先(防止自装 / 形成循环包装)
         ancestor = self.parent_of.get(parent_key)
         seen: set[ItemKey] = set()
@@ -365,6 +406,19 @@ class ReplayKernel:
                 item=current,
             )
 
+        if self.config.seal_aware:
+            # 父件自身或其任一祖先已封签时,不能取出;封签子件仍可整体取出
+            sealed = self.sealed_self_or_ancestor(parent_key)
+            if sealed is not None:
+                return ReplayFailure(
+                    code=SEALED_ANCESTOR,
+                    index=index,
+                    parent=parent_key,
+                    child=child_key,
+                    item=sealed,
+                    detail="取出",
+                )
+
         # ---- 全部校验通过,一次性提交 ----
         del self.parent_of[child_key]
         siblings = self.children_of.get(parent_key)
@@ -377,4 +431,66 @@ class ReplayKernel:
         self.involved.add(parent_key)
         child_node = self.nodes[child_key]
         child_node.success_indices.append(index)
+        return None
+
+    # ----- 封签 / 拆签(仅地点追溯 trace 模式) -----
+
+    def seal(self, index: int, key: ItemKey, seal_id: str) -> ReplayFailure | None:
+        """封签一件实物:持有人已知、自身未封签且无封签祖先时成功。
+
+        成功只在该实物节点上记录当前封签 ID,不改变持有人、包装关系与地点历史。
+        """
+        node = self.nodes.get(key)
+        if node is None or node.holder is None:
+            return ReplayFailure(code=SEAL_HOLDER_MISSING, index=index, item=key)
+        if node.seal_id is not None:
+            return ReplayFailure(
+                code=ALREADY_SEALED, index=index, item=key, expected=node.seal_id
+            )
+        ancestor = self.sealed_ancestor(key)
+        if ancestor is not None:
+            return ReplayFailure(
+                code=SEALED_ANCESTOR,
+                index=index,
+                item=key,
+                parent=ancestor,
+                detail="seal",
+            )
+
+        # ---- 全部校验通过,一次性提交 ----
+        node.seal_id = seal_id
+        node.success_indices.append(index)
+        self.involved.add(key)
+        return None
+
+    def unseal(self, index: int, key: ItemKey, seal_id: str) -> ReplayFailure | None:
+        """拆签一件实物:须匹配自身当前封签,且无封签祖先(由外向内逐层拆)。
+
+        成功清除该实物节点的封签 ID,不改变持有人、包装关系与地点历史。
+        """
+        node = self.nodes.get(key)
+        if node is None or node.seal_id is None:
+            return ReplayFailure(code=NOT_SEALED, index=index, item=key)
+        if node.seal_id != seal_id:
+            return ReplayFailure(
+                code=SEAL_ID_MISMATCH,
+                index=index,
+                item=key,
+                expected=node.seal_id,
+                actual=seal_id,
+            )
+        ancestor = self.sealed_ancestor(key)
+        if ancestor is not None:
+            return ReplayFailure(
+                code=SEALED_ANCESTOR,
+                index=index,
+                item=key,
+                parent=ancestor,
+                detail="unseal",
+            )
+
+        # ---- 全部校验通过,一次性提交 ----
+        node.seal_id = None
+        node.success_indices.append(index)
+        self.involved.add(key)
         return None
