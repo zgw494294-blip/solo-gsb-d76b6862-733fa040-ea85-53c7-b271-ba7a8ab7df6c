@@ -58,6 +58,14 @@ def unpack(parent, child, at="2026-09-01T00:00:00Z"):
     return {"action": "unpack", "parent_scan": parent, "child_scan": child, "occurred_at": at}
 
 
+def seal(sc, seal_id, at="2026-09-01T00:00:00Z"):
+    return {"action": "seal", "scan": sc, "seal_id": seal_id, "occurred_at": at}
+
+
+def unseal(sc, seal_id, at="2026-09-01T00:00:00Z"):
+    return {"action": "unseal", "scan": sc, "seal_id": seal_id, "occurred_at": at}
+
+
 def post(scans, rules, events, expected=200, contact_until=None):
     payload: dict = {"scans": scans, "rules": rules, "events": events}
     if contact_until is not None:
@@ -800,6 +808,304 @@ def test_contacts_empty_when_no_co_location():
         [HIT, MISS1], [RULE_HIT], events, contact_until="2026-09-01T01:00:00Z"
     )
     assert body["contacts"] == []
+
+
+# ---------- 封签 / 拆签 ----------
+
+
+def test_seal_requires_known_holder():
+    # ITEM 在库存中但从未成功交接,持有人未知
+    body = post([ITEM], [rule("R1", gtin=GTIN3)], [seal(ITEM, "S1")])
+    assert [e["index"] for e in body["errors"]] == [0]
+    assert "持有人未知" in body["errors"][0]["reason"]
+    assert body["sealed_items"] == []
+
+
+def test_seal_success_and_sorted_sealed_items():
+    events = [
+        transfer(ITEM, "2026-09-01T00:00:00Z", "WH-A"),
+        seal(ITEM, "SEAL-1", "2026-09-01T01:00:00Z"),
+    ]
+    body = post([ITEM], [rule("R1", gtin=GTIN3)], events)
+    assert body["errors"] == []
+    assert body["sealed_items"] == [
+        {"gtin": GTIN3, "serial": "ITEM", "seal_id": "SEAL-1"}
+    ]
+    # 封签不改变地点 / 持有人
+    assert body["items"][0]["locations"] == ["WH-A"]
+
+
+def test_seal_unseal_seal_cycle_and_sealed_items_final_state():
+    events = [
+        transfer(ITEM, "2026-09-01T00:00:00Z", "WH-A"),
+        seal(ITEM, "S1", "2026-09-01T01:00:00Z"),
+        unseal(ITEM, "S1", "2026-09-01T02:00:00Z"),
+        seal(ITEM, "S2", "2026-09-01T03:00:00Z"),
+    ]
+    body = post([ITEM], [rule("R1", gtin=GTIN3)], events)
+    assert body["errors"] == []
+    assert body["sealed_items"] == [{"gtin": GTIN3, "serial": "ITEM", "seal_id": "S2"}]
+    # 全部拆签后清单为空
+    body2 = post(
+        [ITEM],
+        [rule("R1", gtin=GTIN3)],
+        events + [unseal(ITEM, "S2", "2026-09-01T04:00:00Z")],
+    )
+    assert body2["errors"] == []
+    assert body2["sealed_items"] == []
+
+
+def test_double_seal_rejected():
+    events = [
+        transfer(ITEM, "2026-09-01T00:00:00Z", "WH-A"),
+        seal(ITEM, "S1", "2026-09-01T01:00:00Z"),
+        seal(ITEM, "S2", "2026-09-01T02:00:00Z"),  # 重复封签失败,seal_id 不变
+    ]
+    body = post([ITEM], [rule("R1", gtin=GTIN3)], events)
+    assert [e["index"] for e in body["errors"]] == [2]
+    assert "已封签" in body["errors"][0]["reason"]
+    assert body["sealed_items"] == [{"gtin": GTIN3, "serial": "ITEM", "seal_id": "S1"}]
+
+
+def test_unseal_not_sealed_and_seal_id_mismatch():
+    events = [
+        transfer(ITEM, "2026-09-01T00:00:00Z", "WH-A"),
+        unseal(ITEM, "S0", "2026-09-01T00:30:00Z"),  # 未封签
+        seal(ITEM, "S1", "2026-09-01T01:00:00Z"),
+        unseal(ITEM, "S9", "2026-09-01T02:00:00Z"),  # seal_id 不匹配,不拆签
+    ]
+    body = post([ITEM], [rule("R1", gtin=GTIN3)], events)
+    assert [e["index"] for e in body["errors"]] == [1, 3]
+    assert "未封签" in body["errors"][0]["reason"]
+    assert "不匹配" in body["errors"][1]["reason"]
+    assert body["sealed_items"] == [{"gtin": GTIN3, "serial": "ITEM", "seal_id": "S1"}]
+
+
+def test_seal_under_sealed_ancestor_rejected_nested():
+    # PALLET -> CASE -> ITEM:封托盘后,再封箱 / 封件都因已封签祖先失败
+    events = [
+        *ALL_AT_A,
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        pack(CASE, ITEM, "2026-09-01T02:00:00Z"),
+        seal(PALLET, "SEAL-P", "2026-09-01T03:00:00Z"),
+        seal(CASE, "SEAL-C", "2026-09-01T04:00:00Z"),  # 祖先 PALLET 已封签
+        seal(ITEM, "SEAL-I", "2026-09-01T05:00:00Z"),  # 祖先 PALLET 已封签
+    ]
+    body = post([PALLET, CASE, ITEM], [rule("R1", gtin=GTIN)], events)
+    assert [e["index"] for e in body["errors"]] == [6, 7]
+    assert "祖先" in body["errors"][0]["reason"] and "SEAL-P" in body["errors"][0]["reason"]
+    assert body["sealed_items"] == [
+        {"gtin": GTIN, "serial": "PALLET", "seal_id": "SEAL-P"}
+    ]
+
+
+def test_nested_unseal_must_outer_first():
+    # 箱先装入托盘,再各自封签形成嵌套封签:未拆外层封签前,拆内层(箱)封签失败
+    events = [
+        *ALL_AT_A,
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        seal(CASE, "SEAL-C", "2026-09-01T02:00:00Z"),
+        seal(PALLET, "SEAL-P", "2026-09-01T03:00:00Z"),
+        unseal(CASE, "SEAL-C", "2026-09-01T04:00:00Z"),  # 祖先 PALLET 已封签,失败
+        unseal(PALLET, "SEAL-P", "2026-09-01T05:00:00Z"),  # 先拆外层,成功
+        unseal(CASE, "SEAL-C", "2026-09-01T06:00:00Z"),  # 再拆内层,成功
+    ]
+    body = post([PALLET, CASE, ITEM], [rule("R1", gtin=GTIN2)], events)
+    assert [e["index"] for e in body["errors"]] == [6]
+    assert "祖先" in body["errors"][0]["reason"] and "SEAL-P" in body["errors"][0]["reason"]
+    assert body["sealed_items"] == []
+
+
+def test_pack_unpack_fails_when_parent_or_ancestor_sealed():
+    extra = scan(GTIN4, "EXTRA")
+    events = [
+        transfer(extra, "2026-09-01T00:00:00Z", "WH-A"),
+        *ALL_AT_A,
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        pack(CASE, ITEM, "2026-09-01T01:30:00Z"),  # 封签前正常装入
+        seal(PALLET, "SEAL-P", "2026-09-01T02:00:00Z"),
+        pack(CASE, extra, "2026-09-01T03:00:00Z"),  # 父件 CASE 未封签,但祖先 PALLET 已封签
+        pack(PALLET, extra, "2026-09-01T03:30:00Z"),  # 父件 PALLET 自身已封签
+        unpack(PALLET, CASE, "2026-09-01T04:00:00Z"),  # 父件自身已封签
+    ]
+    body = post([PALLET, CASE, ITEM, extra], [rule("R1", gtin=GTIN4)], events)
+    assert [e["index"] for e in body["errors"]] == [7, 8, 9]
+    assert "祖先" in body["errors"][0]["reason"] and "SEAL-P" in body["errors"][0]["reason"]
+    assert "父件" in body["errors"][1]["reason"]
+    assert "取出失败" in body["errors"][2]["reason"]
+    # 失败装拆不改变关系 / 封签:只有 PALLET 仍封签,CASE 仍是其直接子件
+    assert body["sealed_items"] == [
+        {"gtin": GTIN, "serial": "PALLET", "seal_id": "SEAL-P"}
+    ]
+    # 拆签后,原被封签拒绝的取出在更晚时刻重试即成功(封签状态与失败前一致)
+    events2 = events + [
+        unseal(PALLET, "SEAL-P", "2026-09-01T05:00:00Z"),
+        unpack(PALLET, CASE, "2026-09-01T06:00:00Z"),
+    ]
+    body2 = post([PALLET, CASE, ITEM, extra], [rule("R1", gtin=GTIN2)], events2)
+    assert [e["index"] for e in body2["errors"]] == [7, 8, 9]
+    assert body2["sealed_items"] == []
+
+
+def test_sealed_child_can_pack_and_unpack_and_transfer_as_whole():
+    # 已封签的子件仍可整体装入未封签容器、取出;根件交接带动全部(含封签)后代
+    events = [
+        *ALL_AT_A,
+        seal(ITEM, "SEAL-I", "2026-09-01T00:30:00Z"),
+        pack(CASE, ITEM, "2026-09-01T01:00:00Z"),  # 父件 CASE 未封签:成功
+        pack(PALLET, CASE, "2026-09-01T02:00:00Z"),
+        transfer(PALLET, "2026-09-01T03:00:00Z", "WH-B", from_loc="WH-A"),  # 整树带动
+        unpack(CASE, ITEM, "2026-09-01T04:00:00Z"),  # 封签子件仍可取出
+    ]
+    body = post(
+        [PALLET, CASE, ITEM],
+        [rule("R1", gtin=GTIN3)],
+        events,
+        contact_until="2026-09-01T05:00:00Z",
+    )
+    assert body["errors"] == []
+    assert body["items"][0]["locations"] == ["WH-A", "WH-B"]
+    assert body["sealed_items"] == [
+        {"gtin": GTIN3, "serial": "ITEM", "seal_id": "SEAL-I"}
+    ]
+    # 取出后 ITEM 保留 WH-B(封签不影响持有人)
+    contacts = [c for c in body["contacts"] if c["missed_item"]["serial"] == "CASE"]
+    assert (
+        "2026-09-01T03:00:00Z",
+        "2026-09-01T05:00:00Z",
+    ) in [(c["start_time"], c["end_time"]) for c in contacts if c["location"] == "WH-B"]
+
+
+def test_root_transfer_after_failed_sealed_unpack_still_propagates():
+    # 封签后违规取出失败:包装关系不变,根件交接仍带动后代
+    events = [
+        *ALL_AT_A,
+        pack(PALLET, CASE, "2026-09-01T01:00:00Z"),
+        pack(CASE, ITEM, "2026-09-01T02:00:00Z"),
+        seal(CASE, "SEAL-C", "2026-09-01T03:00:00Z"),
+        unpack(CASE, ITEM, "2026-09-01T04:00:00Z"),  # 父件 CASE 已封签,失败
+        transfer(PALLET, "2026-09-01T05:00:00Z", "WH-B", from_loc="WH-A"),  # 整树成功
+    ]
+    body = post([PALLET, CASE, ITEM], [rule("R1", gtin=GTIN3)], events)
+    assert [e["index"] for e in body["errors"]] == [6]
+    assert body["items"][0]["locations"] == ["WH-A", "WH-B"]
+    assert body["sealed_items"] == [
+        {"gtin": GTIN2, "serial": "CASE", "seal_id": "SEAL-C"}
+    ]
+
+
+def test_seal_event_scan_errors_indexed_and_not_effective():
+    ghost = scan(GTIN4, "GHOST")
+    events = [
+        transfer(ITEM, "2026-09-01T00:00:00Z", "WH-A"),
+        seal("01" + GTIN3 + "99", "S1", "2026-09-01T01:00:00Z"),  # 扫描非法
+        seal(ghost, "S2", "2026-09-01T02:00:00Z"),  # 不在库存
+        seal(ITEM, "", "2026-09-01T03:00:00Z"),  # 空 seal_id:请求级 422
+    ]
+    body = post([ITEM], [rule("R1", gtin=GTIN3)], events[:3])
+    assert [e["index"] for e in body["errors"]] == [1, 2]
+    assert "扫描非法" in body["errors"][0]["reason"]
+    assert "不在库存扫描中" in body["errors"][1]["reason"]
+    assert body["sealed_items"] == []  # 失败事件不封签,但仍附空清单
+    resp = client.post(
+        "/v1/recall/location-trace",
+        json={"scans": [ITEM], "rules": [rule("R1", gtin=GTIN3)], "events": events},
+    )
+    assert resp.status_code == 422
+
+
+def test_sealed_items_includes_non_hit_items_sorted_by_gtin_serial():
+    # sealed_items 列出全部最终封签实物(不论是否命中召回),按 GTIN、序列号排序
+    events = [
+        transfer(ITEM, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(CASE, "2026-09-01T00:01:00Z", "WH-A"),
+        seal(CASE, "S-CASE", "2026-09-01T01:00:00Z"),
+        seal(ITEM, "S-ITEM", "2026-09-01T02:00:00Z"),
+    ]
+    body = post([CASE, ITEM], [rule("R1", gtin=GTIN3)], events)
+    assert body["items"] == [
+        {"gtin": GTIN3, "serial": "ITEM", "locations": ["WH-A"], "rule_ids": ["R1"]}
+    ]
+    assert body["sealed_items"] == [
+        {"gtin": GTIN2, "serial": "CASE", "seal_id": "S-CASE"},
+        {"gtin": GTIN3, "serial": "ITEM", "seal_id": "S-ITEM"},
+    ]
+
+
+def test_sealed_items_absent_without_seal_events():
+    events = [
+        transfer(ITEM, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(ITEM, "2026-09-01T01:00:00Z", "WH-B", from_loc="WH-A"),
+    ]
+    body = post([ITEM], [rule("R1", gtin=GTIN3)], events)
+    assert "sealed_items" not in body
+    body = post(
+        [ITEM], [rule("R1", gtin=GTIN3)], events, contact_until="2026-09-01T02:00:00Z"
+    )
+    assert "sealed_items" not in body and body["contacts"] == []
+
+
+def test_seal_event_shape_validation():
+    base = {
+        "scans": [ITEM],
+        "rules": [rule("R1", gtin=GTIN3)],
+    }
+    _expect_422(
+        {
+            **base,
+            "events": [
+                {"action": "seal", "scan": ITEM, "seal_id": "S1",
+                 "occurred_at": "2026-09-01T00:00:00"}  # 缺时区
+            ],
+        }
+    )
+    _expect_422(
+        {
+            **base,
+            "events": [
+                {"action": "seal", "scan": ITEM,
+                 "occurred_at": "2026-09-01T00:00:00Z"}  # 缺 seal_id
+            ],
+        }
+    )
+    _expect_422(
+        {
+            **base,
+            "events": [
+                {"action": "unseal", "scan": ITEM, "seal_id": "S1",
+                 "occurred_at": "2026-09-01T00:00:00Z", "extra": 1}  # 多余字段
+            ],
+        }
+    )
+    _expect_422(
+        {
+            **base,
+            "events": [
+                {"action": "seal", "scan": ITEM, "seal_id": "S1",
+                 "occurred_at": "2026-09-01T00:00:00Z",
+                 "parent_scan": CASE}  # seal 不允许 pack 字段
+            ],
+        }
+    )
+
+
+def test_seal_events_same_utc_ordering_as_other_events():
+    # 事件按 UTC 排序而非输入顺序:封签输入在最后,但 UTC 时刻介于装入与取出之间,
+    # 故按 UTC 重放时取出发生在封签之后而失败
+    events = [
+        transfer(PALLET, "2026-09-01T00:00:00Z", "WH-A"),
+        transfer(CASE, "2026-09-01T00:01:00Z", "WH-A"),
+        transfer(ITEM, "2026-09-01T00:02:00Z", "WH-A"),
+        pack(PALLET, CASE, "2026-09-01T00:10:00Z"),
+        unpack(PALLET, CASE, "2026-09-01T00:30:00Z"),  # 输入在中;重放时最后执行,失败
+        seal(PALLET, "SEAL-P", "2026-09-01T08:20:00+08:00"),  # UTC 00:20,按 UTC 提前
+    ]
+    body = post([PALLET, CASE, ITEM], [rule("R1", gtin=GTIN)], events)
+    assert [e["index"] for e in body["errors"]] == [4]
+    assert "封签" in body["errors"][0]["reason"]
+    assert body["sealed_items"] == [
+        {"gtin": GTIN, "serial": "PALLET", "seal_id": "SEAL-P"}
+    ]
 
 
 # ---------- 旧接口回归 ----------
